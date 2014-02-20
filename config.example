@@ -1,0 +1,55 @@
+# Stocks (or any time series under /stocks/) will have its raw data stored into Amazon S3.
+# These data will be recorded exactly when they come in, but the data will only be committed
+# to S3 every hour.
+timeseries "/trades/" {
+    storage service {
+        type "disk"
+        data-dir "/Users/iammisc/Projects/hquant2/testArchive/"
+        frequency every 30 minutes
+    }
+    schema { # This defines the data format we will be storing. This allows the aggregation methods
+             # to work appropriately, and allows the system to give correct size estimates.
+        Fixed(10, 4) price
+        Integer      vol
+    }
+    # # The data will be deleted from S3 after 6 months
+    keep 6 months
+}
+
+timeseries "/reports/" {
+    storage service {
+       type "S3"
+       s3-bucket "blahreports"
+       frequency every day
+    }
+    schema {
+        String    secURL
+        String    reportType
+    }
+    keep forever
+}
+
+# The "forever" aggregation is defined on /stocks/* (it will be updated based on data sent to any stock time series)
+# It will be accessible under the URL forever@/stocks/MSFT
+aggregation "stockInfo" {
+    storage service {
+         type "S3"
+         s3-bucket "blah"
+         frequency every 15 minutes
+         #    ...we never delete anything from this repository.
+         keep forever
+    }
+    schema {
+         First open    { missing lag(close, 1) } on price
+         Min   low     { missing use(open) }     on price
+         Max   high    { missing use(open) }     on price
+         Last  close   { missing use(open) }     on price
+         Sum   cVol    { missing lag(cVol, 1) }  on vol
+    }
+    # The aggregation is calculated from all stocks...
+    target "/trades/"
+    # The aggregation will be calculated once per day
+    frequency daily
+    # The raw data will be grouped into 15 minute increments
+    period 15 minutes
+}
