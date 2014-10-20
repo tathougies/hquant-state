@@ -4,6 +4,7 @@ module Finance.HQuant.State.Types where
 import Prelude hiding (foldr)
 
 import Control.Monad.Identity
+import Control.Concurrent.MVar
 import Control.Comonad
 import Control.Applicative
 
@@ -22,6 +23,8 @@ import Data.Time.Calendar
 import Data.Foldable hiding (concat)
 import Data.Functor
 import Data.Ratio
+
+import Network.HTTP.Conduit (Manager)
 
 newtype SeriesName = SeriesName { unSeriesName :: T.Text }
     deriving (Show, Read, Eq, Ord, IsString, SafeCopy, Typeable)
@@ -107,6 +110,11 @@ extractSeq (FixedSeq e s) = FixedQD   (fromRational ((fromIntegral . extract $ s
 extractSeq (StringSeq  s) = StringQD  (extract s)
 extractSeq (IntegerSeq s) = IntegerQD (extract s)
 
+extractSeqUnqualified :: Comonad f => SeriesSeq f -> Datum
+extractSeqUnqualified (FixedSeq _ s) = FixedD (extract s)
+extractSeqUnqualified (StringSeq  s) = StringD (extract s)
+extractSeqUnqualified (IntegerSeq s) = IntegerD (extract s)
+
 -- ** Time types
 
 data TimeUnit = Years | Months | Weeks | Days | Hours | Minutes | Seconds
@@ -159,6 +167,9 @@ instance Foldable m => Show (SeriesSeq m) where
 
 deriving instance Show SeriesSeqWrapper
 deriveSafeCopy 0 'base ''SeriesSeqWrapper
+
+aggregationApplies :: TSNamePattern -> SeriesName -> Bool
+aggregationApplies aggTarget seriesName = seriesName `matchesPattern` aggTarget
 
 negateDuration :: Duration -> Duration
 negateDuration Forever = Forever

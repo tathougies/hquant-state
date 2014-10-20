@@ -3,9 +3,10 @@
 # to S3 every hour.
 timeseries "/trades/" {
     storage service {
-        type "disk"
-        data-dir "/Users/iammisc/Projects/hquant2/testArchive/"
-        frequency every 30 minutes
+        type "S3"
+        s3-bucket "tathougies-hquant"
+        s3-object-prefix "test"
+        frequency every 10 seconds
     }
     schema { # This defines the data format we will be storing. This allows the aggregation methods
              # to work appropriately, and allows the system to give correct size estimates.
@@ -35,7 +36,7 @@ aggregation "stockInfo" {
     storage service {
          type "S3"
          s3-bucket "blah"
-         frequency every 15 minutes
+         frequency every 3 hours
          #    ...we never delete anything from this repository.
          keep forever
     }
@@ -48,8 +49,8 @@ aggregation "stockInfo" {
     }
     # The aggregation is calculated from all stocks...
     target "/trades/"
-    # The aggregation will be calculated once per day
-    frequency daily
+    # The aggregation will be calculated every 15 minutes
+    frequency every 15 minutes
     # The raw data will be grouped into 15 minute increments
     period 15 minutes
 }

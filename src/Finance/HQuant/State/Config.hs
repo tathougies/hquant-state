@@ -82,14 +82,16 @@ duration = (try (symbol "forever") *> pure Forever) <|>
 storageService :: ConfParser StorageServiceDeclaration
 storageService = (mkStorageService =<< braces (many storageServiceInner))
     where storageServiceInner :: ConfParser (Either String (StorageServiceDeclaration -> StorageServiceDeclaration))
-          storageServiceInner = ssType <|> ssFrequency <|> ssKeepForP <|> s3BucketP <|> dDirP
+          storageServiceInner = ssType <|> ssFrequency <|> ssKeepForP <|> s3BucketP <|> s3ObjPfxP <|> dDirP
 
           ssType      = Left <$> (symbol "type" *> stringLiteral)
           ssFrequency = Right <$> (symbol "frequency" *> ((ssdFrequency .~) <$> frequency))
           ssKeepForP  = Right <$> (symbol "keep"      *> ((ssdKeepFor   .~) <$> duration))
 
-          s3BucketP = Right <$> (symbol "s3-bucket" *>
+          s3BucketP = Right <$> (try (symbol "s3-bucket") *>
                                  ((s3dBucket .~) . fromString <$> stringLiteral <?> "S3 bucket name"))
+          s3ObjPfxP = Right <$> (try (symbol "s3-object-prefix") *>
+                                 ((s3dObjPfx .~) . fromString <$> stringLiteral <?> "S3 bucket name"))
           dDirP     = Right <$> (symbol "data-dir"  *>
                                   ((ddPath .~) . fromString <$> stringLiteral <?> "Data directory name"))
 
@@ -99,6 +101,7 @@ storageService = (mkStorageService =<< braces (many storageServiceInner))
                             ["S3"]   -> return $
                                         S3Declaration
                                         { _s3dBucket = error "No S3 bucket given in config"
+                                        , _s3dObjPfx = fromString ""
                                         , _s3dFrequency = error "No frequency given in config"
                                         , _s3dKeepFor = Forever }
                             ["disk"] -> return $

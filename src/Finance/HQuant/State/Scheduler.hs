@@ -7,6 +7,7 @@ import Finance.HQuant.State.ACID hiding (aggregate)
 import Finance.HQuant.State.Config
 import Finance.HQuant.State.Types
 import Finance.HQuant.State.Storage
+import Finance.HQuant.State.Aggregations
 
 import Control.Applicative
 import Control.Monad
@@ -20,12 +21,16 @@ import qualified Data.Text as T
 import qualified Data.ByteString as BS
 import Data.Sequence (Seq)
 import Data.Function
+import Data.Foldable (toList)
 import Data.Ord
 import Data.Maybe
 import Data.List
+import Data.Either
 import Data.Time.Clock
 import Data.Acid
 import Data.ByteString (ByteString)
+
+import Network.HTTP.Conduit (Manager)
 
 import System.Log.Logger
 
@@ -39,6 +44,7 @@ data SchedulerState = SchedulerState
     , schStAcidState  :: AcidState HQuantState
     , schStPerforming :: TVar (S.Set (SchedulableAction SeriesName))
     , schStSchLastUpd :: TVar UTCTime -- ^ This is written to whenever there was a schedule change
+    , schStHttpMgr    :: MVar (Maybe Manager)
     }
 
 moduleName = "Finance.HQuant.State.Scheduler"
@@ -102,16 +108,19 @@ storeTimeSeries st at sn d signalFinished = do
            warningM moduleName $ "storeTimeSeries: " ++ err
            signalFinished
     Right (times, r)  -> do
+           infoM moduleName $ "storeTimeSeries " ++ (T.unpack . unSeriesName $ sn)
            let columns = map unWrapSeries r
-               columnNames = map _fieldDName (_schemaDFields . _tsdSchema $ d)
-           forkIO (store d at sn (formatSeries columnNames times columns))
+               columnNames = case d of
+                               TimeSeriesDecl  {} -> map _fieldDName (_schemaDFields . _tsdSchema $ d)
+                               AggregationDecl {} -> map _aggFieldName (_aggSchemaFields . _aggSchema $ d)
+           forkIO (store (schStHttpMgr st) d at sn (formatSeries columnNames times columns))
            signalFinished
 
 cullTimeSeries :: SchedulerState -> UTCTime -> SeriesName -> SeriesDeclaration -> IO () -> IO ()
 cullTimeSeries st at sn d signalFinished = do
-  -- update (schStAcidState st) (DeleteData sn at ((_tsdKeepFor d)`addDuration` at))
+  let Just ssd = d ^. sdStorageService
   infoM moduleName $ concat [ "Cull time series '", T.unpack . unSeriesName $ sn, "'. Delete from "
-                            , show at, " to ", show ((_tsdKeepFor d) `addDuration` at)]
+                            , show at, " to ", show ((ssd ^. ssdKeepFor) `addDuration` at)]
   signalFinished
 
 aggregate :: SchedulerState -> UTCTime -> AggregationName -> SeriesName -> SeriesDeclaration
@@ -128,7 +137,10 @@ aggregate st at an sn d signalFinished = do
     Right (times, r) -> do
            let columns = map unWrapSeries r
                columnNames = map _aggFieldName (_aggSchemaFields . _aggSchema $ d)
-           forkIO (store d at sn (formatSeries columnNames times columns))
+               dats = map (map extractSeqUnqualified) (unfoldSeriesI columns)
+           rUpdates <- mapM (\(time, dats) -> update (schStAcidState st) (TimeSeriesDatum (aggSeriesName an sn) time dats)) (zip (toList times) dats)
+           let updateErrs = lefts rUpdates
+           mapM_ (\err -> warningM moduleName $ "aggregate [TimeSeriesDatum]: " ++ err) updateErrs
            signalFinished
 
 getLastRunTime :: SchedulerState -> Frequency -> SchedulableAction SeriesName -> IO UTCTime
@@ -168,16 +180,19 @@ actionsFor :: SchedulerState -> SeriesDeclaration -> SeriesName
            -> [(Frequency, SchedulableAction (SeriesName, SeriesDeclaration))]
 actionsFor st d@(TimeSeriesDecl {}) sn = execWriter $ do
   case _tsdStorageService d of
-    Nothing -> return Nothing
+    Nothing -> return ()
     Just sd -> do
-      tell [(sd ^. ssdFrequency, StoreTimeSeries (sn, d))]
-      return (Just (sd ^. ssdFrequency))
-  case _tsdKeepFor d of
-    Forever     -> return Nothing
-    For x units -> do
-      tell [(Every (fromIntegral x) units, CullTimeSeries (sn, d))]
-      return (Just (Every (fromIntegral x) units))
-actionsFor st d@(AggregationDecl {}) sn = [(_aggFrequency d, PerformAggregation (_aggName d, d) (sn, d))]
+      tell [ (sd ^. ssdFrequency, StoreTimeSeries (sn, d)) ]
+      when (sd ^. ssdKeepFor /= Forever) $
+           tell [ (sd ^. ssdFrequency, CullTimeSeries  (sn, d)) ]
+actionsFor st d@(AggregationDecl {}) sn = execWriter $ do
+    tell [ (_aggFrequency d, PerformAggregation (_aggName d, d) (sn, d)) ]
+    case _aggStorageService d of
+      Nothing -> return ()
+      Just sd -> do
+        tell [ (sd ^. ssdFrequency, StoreTimeSeries (aggSeriesName (_aggName d) sn, d)) ]
+        when (sd ^. ssdKeepFor /= Forever) $
+             tell [ (sd ^. ssdFrequency, CullTimeSeries  (sn, d)) ]
 
 updateSchedule :: SchedulerState -> SeriesDeclaration -> IO ()
 updateSchedule st d = do
@@ -191,8 +206,8 @@ updateSchedule st d = do
 runAction :: SchedulerState -> UTCTime -> SchedulableAction (SeriesName, SeriesDeclaration) -> IO ()
 runAction st at action = runAction'
     where runAction' = case action of
+                         CullTimeSeries     (sn, d)  -> cullTimeSeries st at sn d finishAction
                          StoreTimeSeries    (sn, d)  -> storeTimeSeries st at sn d finishAction
-                         CullTimeSeries     (sn, d)  -> cullTimeSeries  st at sn d finishAction
                          PerformAggregation (an, d) (sn, _) -> aggregate st at an sn d finishAction
 
           finishAction = update (schStAcidState st) (UpdateLastRunTime genericAction at)
@@ -204,20 +219,19 @@ runActions :: SchedulerState
            -> IO ()
 runActions st actions = do
   let actionSeries (StoreTimeSeries    sn)   = fst sn
-      actionSeries (CullTimeSeries     sn)   = fst sn
       actionSeries (PerformAggregation _ sn) = fst sn
+      actionSeries (CullTimeSeries     sn)   = fst sn
 
-      grouped = groupBy ((==) `on` (actionSeries . snd)) $
+      -- We need this so that we perform the aggregation before attempting to store things
+      relOrder     (StoreTimeSeries _)      = 1
+      relOrder     (PerformAggregation _ _) = 0
+      relOrder     (CullTimeSeries _)       = 2
+
+      grouped = map (sortBy (comparing (relOrder . snd))) $
+                groupBy ((==) `on` (actionSeries . snd)) $
                 sortBy (comparing (actionSeries . snd)) actions
 
-      -- This function produces the relative order of all actions. This makes sure culls always go
-      -- last.
-      relOrder (time, StoreTimeSeries _)      = (time, 0)
-      relOrder (time, CullTimeSeries _)       = (time, 3)
-      relOrder (time, PerformAggregation _ _) = (time, 0)
-      groupedAndSorted = map (sortBy (comparing relOrder)) grouped -- This ensures that all grouped
-                                                                  -- actions are run in order by time
-  mapM_ (forkIO . mapM_ (uncurry (runAction st))) groupedAndSorted -- This will run all the actions in separate threads...
+  mapM_ (forkIO . mapM_ (uncurry (runAction st))) grouped -- This will run all the actions in separate threads...
 
 runSchedule :: SchedulerState -> IO ()
 runSchedule st = runSchedule'
@@ -265,11 +279,13 @@ maintainSeries acidSt seriess = do
   performingV  <- newTVarIO S.empty     -- We start performing nothing
   now          <- getCurrentTime
   lastUpdatedV <- newTVarIO now
+  httpMgr      <- newMVar Nothing
   let st = SchedulerState
            { schStSchedule   = scheduleV
            , schStAcidState  = acidSt
            , schStPerforming = performingV
-           , schStSchLastUpd = lastUpdatedV }
+           , schStSchLastUpd = lastUpdatedV
+           , schStHttpMgr    = httpMgr }
       seriesName d@(AggregationDecl {}) = SeriesName . unTSNamePattern . _aggTarget $ d
       seriesName d@(TimeSeriesDecl {})  = SeriesName . unTSNamePattern . _tsdNamePattern $ d
 

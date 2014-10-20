@@ -33,6 +33,19 @@ import Data.Foldable
 
 import Debug.Trace
 
+aggSeriesName :: AggregationName -> SeriesName -> SeriesName
+aggSeriesName aggName seriesName = SeriesName (T.concat [unSeriesName aggName, ":", unSeriesName seriesName])
+
+aggAndSeriesFromName :: SeriesName -> Maybe (AggregationName, SeriesName)
+aggAndSeriesFromName aggName = case T.split (== ':') (unSeriesName aggName) of
+                                 [_]    -> Just ("", aggName) -- This didn't have an aggregation prefix
+                                 [a, x] -> Just (SeriesName a, SeriesName x)
+                                 _      -> Nothing
+
+extractSeriesNameFromAggName aggName = case aggAndSeriesFromName aggName of
+                                         Nothing     -> error "extractSeriesNameFromAggName: Series names should not have ':'s"
+                                         Just (_, a) -> a
+
 combineTimes :: Ord a => Seq a -> Seq a -> Seq a
 combineTimes (viewl -> EmptyL) _ = Seq.empty
 combineTimes _ (viewl -> EmptyL) = Seq.empty
@@ -81,6 +94,7 @@ runComplexMigration Sum seriess = adjustSeqNum (MaybeSeq . fmap doSum . unDouble
     where doSum s
               | Seq.null s = Nothing
               | otherwise  = Just (sum s)
+runComplexMigration Count seriess = adjustSeq' (IntegerSeq . MaybeSeq . fmap (Just . fromIntegral . Seq.length) . unDoubleSeq) seriess
 
 runAggregation :: Seq UTCTime -> [(FieldName, SeriesSeq DoubleSeq)] -> AggFieldDeclaration -> Either String (SeriesSeq MaybeSeq)
 runAggregation periods groupedData declaration =
@@ -88,7 +102,7 @@ runAggregation periods groupedData declaration =
       Nothing     -> Left $ "Couldn't find target field " ++ (T.unpack . unFieldName . _aggTargetFieldName $ declaration)
       Just inData
           | aToAAggregation (_aggFieldMethod declaration) -> Right $ adjustSeq (MaybeSeq . aggregateAToA (_aggFieldMethod declaration) . unDoubleSeq) inData
-          | otherwise                                    -> Right $ runComplexMigration (_aggFieldMethod declaration) inData
+          | otherwise                                     -> Right $ runComplexMigration (_aggFieldMethod declaration) inData
 
                      --     doAggregation :: Ord a => Seq (Seq a) -> (Seq a, Seq UTCTime)
                      --     doAggregation ss = let aggregated = aggregate (_aggFieldMethod declaration) ss
@@ -149,6 +163,21 @@ runMissingMethod (AMMLag idx i) _      seriess _     = let series = seriess !! i
                                                                         else Nothing
                                                        in adjustSeq (lag . unMaybeSeq) series
 
+
+unfoldSeriesI :: [SeriesSeq Seq] -> [[SeriesSeq Identity]]
+unfoldSeriesI seriess
+    | any (adjustSeq' Seq.null) seriess = []
+    | otherwise = map (adjustSeq (fst . unUnfoldTuple)) headsAndTails : rest
+    where headsAndTails = map (adjustSeq doUnfold) seriess
+
+          rest = if any (adjustSeq' (Seq.null . snd . unUnfoldTuple)) headsAndTails
+                 then []
+                 else unfoldSeriesI (map (adjustSeq (fmap extract . snd . unUnfoldTuple)) headsAndTails)
+
+          doUnfold :: Seq a -> UnfoldTuple Identity a
+          doUnfold s = case viewl s of
+                         x :< r -> UnfoldTuple (return x, fmap return r)
+
 unfoldSeries :: [SeriesSeq MaybeSeq] -> [[SeriesSeq Maybe]]
 unfoldSeries seriess = map (adjustSeq (fst . unUnfoldTuple)) headsAndTails : rest
     where headsAndTails = map (adjustSeq doUnfold) seriess
@@ -172,3 +201,23 @@ appendCalculatingMissing methods seriess dats = Right [adjustSeq2 addDat series 
           conSeries method accum series dat
               | adjustSeq' isNothing dat = runMissingMethod method series seriess accum
               | otherwise                = dat
+
+-- | Infers the types of the aggregation schema declaration fields based on the target's field types
+deriveAggSchema :: AggSchemaDeclaration -> [FieldDeclaration] -> Either String [FieldDeclaration]
+deriveAggSchema aggSchemaD schemaFields = mapM inferField (_aggSchemaFields aggSchemaD)
+    where lookupSchemaField name = lookupSchemaField' name schemaFields
+              where lookupSchemaField' name [] = Left ("Field '" ++ (T.unpack . unFieldName $ name) ++ "' not found in target declaration")
+                    lookupSchemaField' name (field:fields)
+                        | name == _fieldDName field = Right (_fieldDType field)
+                        | otherwise                 = lookupSchemaField' name fields
+
+          inferField aggFieldD = FieldDeclaration (_aggFieldName aggFieldD) <$> inferType aggFieldD
+
+          inferType aggFieldD = let targetN = _aggTargetFieldName aggFieldD
+                                in case _aggFieldMethod aggFieldD of
+                                     First -> lookupSchemaField targetN
+                                     Min   -> lookupSchemaField targetN
+                                     Max   -> lookupSchemaField targetN
+                                     Last  -> lookupSchemaField targetN
+                                     Sum   -> lookupSchemaField targetN
+                                     Count -> return Integer

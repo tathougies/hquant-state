@@ -37,6 +37,7 @@ data SeriesDeclaration = TimeSeriesDecl
 
 data StorageServiceDeclaration = S3Declaration
                                  { _s3dBucket    :: T.Text
+                                 , _s3dObjPfx    :: T.Text
                                  , _s3dFrequency :: Frequency
                                  , _s3dKeepFor   :: Duration}
                                | DiskDeclaration

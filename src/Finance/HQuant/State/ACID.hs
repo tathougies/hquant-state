@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, DeriveDataTypeable, TypeFamilies, RankNTypes, OverloadedStrings, NamedFieldPuns, TupleSections #-}
+{-# LANGUAGE TemplateHaskell, DeriveDataTypeable, TypeFamilies, RankNTypes, OverloadedStrings, NamedFieldPuns, TupleSections, DoAndIfThenElse #-}
 -- | This module provides the base ACID state storage layer.
 --
 module Finance.HQuant.State.ACID where
@@ -32,6 +32,7 @@ import Data.Array (Array, listArray, (!))
 import Data.ByteString (ByteString)
 import Data.Int
 import Data.Typeable
+import Data.Either
 import Data.Time.Clock
 import Data.SafeCopy
 import Data.Maybe
@@ -42,7 +43,7 @@ import Debug.Trace
 import Network
 
 data Series      = Series
-                   { _declaration    :: SeriesDeclaration
+                   { _declaration    :: [FieldDeclaration] -- ^ Descriptions of the columns
                    , _times          :: Seq UTCTime
                    , _seriesData     :: Array Int (SeriesSeq Seq) }
 
@@ -60,6 +61,13 @@ deriveSafeCopy 0 'base ''Series
 
 runError = runIdentity . runErrorT
 
+findAgg :: AggregationName -> [SeriesDeclaration] -> Maybe SeriesDeclaration
+findAgg name declarations = findAgg' declarations
+    where findAgg' [] = Nothing
+          findAgg' (a@AggregationDecl {_aggName}:_)
+              | _aggName == name = Just a
+          findAgg' (_:xs) = findAgg' xs
+
 findDecl :: SeriesName -> [SeriesDeclaration] -> Maybe SeriesDeclaration
 findDecl _ []                                = Nothing
 findDecl name (t@(TimeSeriesDecl {}):series)
@@ -69,14 +77,52 @@ findDecl name (_:series)                        = findDecl name series
 timeSeriesDeclarations :: Query HQuantState [SeriesDeclaration]
 timeSeriesDeclarations = _declarations <$> ask
 
+-- | Given a series name and the declarations. Computes the names of all aggregations that apply.
+--
+--   For example, if there are aggregations "stockInfo1Day" and "stockInfo15Min" that apply to all
+--   "/trades/" series, then if we pass in "/trades/MSFT", we get "stockInfo1Day:/trades/MSFT" and
+--   "stockInfo15Min:/trades/MSFT".
+computeAggs :: SeriesName -> [SeriesDeclaration] -> [SeriesName]
+computeAggs _    []     = []
+computeAggs name (d:ds) = case d of
+                            TimeSeriesDecl {} -> computeAggs name ds
+                            AggregationDecl {}
+                                | name `matchesPattern` (_aggTarget d) ->
+                                    aggSeriesName (_aggName d) name : computeAggs name ds
+                                | otherwise                            ->
+                                    computeAggs name ds
+
+-- | Create the time series with the given name, including possibly creating any aggregations that
+--   apply to the series.
 newTimeSeries :: SeriesName -> Update HQuantState (Either String ())
 newTimeSeries seriesName
-    | not ("/" `T.isPrefixOf` unSeriesName seriesName) = return (Left "Series names must start with '/'")
+    | not (validSeriesName . unSeriesName $  seriesName) = return (Left "Series names must start with '/' or be of the form '<aggregation>:<series>'")
     | otherwise = do
-        decl <- uses declarations (findDecl seriesName)
+        decl <- case aggregationAndTargetOf seriesName of
+                  Nothing                -> maybe (Left "Series not configured") (Right . _schemaDFields . _tsdSchema) <$>
+                                            uses declarations (findDecl seriesName)
+                  Just (aggName, target) -> do
+                    aggDecl <- uses declarations (findAgg aggName)
+                    case aggDecl of
+                      Nothing  -> return (Left "Aggregation not found")
+                      Just agg -> if aggregationApplies (_aggTarget agg) target
+                                  then do
+                                    -- If this aggregation works, then we need to find it's target and attempt
+                                    st <- get
+                                    let tsdDecl = maybe (Left "Aggregation target series not found") Right $
+                                                  (st ^. series ^. at target)
+                                    case tsdDecl of
+                                      Left e -> return (Left e)
+                                      Right tsdDecl ->
+                                          -- This will derive the types of the aggregation schema fields based on those of
+                                          -- the time series.
+                                          case deriveAggSchema (_aggSchema agg) (_declaration tsdDecl) of
+                                            Left  err       -> return (Left err)
+                                            Right aggSchema -> return (Right aggSchema)
+                                  else return (Left $ "Aggregation '" ++ (T.unpack . unSeriesName $ aggName) ++ "' does not apply to series '" ++ (T.unpack . unSeriesName $ target) ++ "'")
         case decl of
-          Nothing -> return (Left "Series not configured")
-          Just decl -> do
+          Left e -> return (Left e)
+          Right decl -> do
               existingDecl <- M.lookup seriesName <$> gets _series
               case existingDecl of
                 Just _  -> return (Left "Series already exists")
@@ -84,13 +130,23 @@ newTimeSeries seriesName
                     let newSeries = Series
                                     { _declaration = decl
                                     , _times       = Seq.empty
-                                    , _seriesData  = listArray (0, fromJust (decl ^? tsdSchema.schemaDFields.to length) - 1) $
-                                                     map mkSeq (fromJust (decl ^? tsdSchema.schemaDFields)) }
-                        mkSeq (FieldDeclaration _ (Fixed _ decimals)) = FixedSeq (10 ^ decimals) Seq.empty
-                        mkSeq (FieldDeclaration _ Integer)            = IntegerSeq Seq.empty
-                        mkSeq (FieldDeclaration _ String)             = StringSeq Seq.empty
-                    series.at seriesName .= Just newSeries
+                                    , _seriesData  = listArray (0, length decl - 1) $
+                                                     map mkSeq decl }
+                        mkSeq (FieldDeclaration _ (Fixed _ decimals)) = FixedSeq   (10 ^ decimals) Seq.empty
+                        mkSeq (FieldDeclaration _ Integer)            = IntegerSeq                 Seq.empty
+                        mkSeq (FieldDeclaration _ String)             = StringSeq                  Seq.empty
+
+                    series.at seriesName .= Just newSeries -- Add the series in so that newTimeSeries can find the target
                     return (Right ())
+    where validSeriesName seriesName = case T.split (== ':') seriesName of
+                                         [aggregation, seriesName] -> validSeriesNameNoAgg seriesName
+                                         [seriesName]              -> validSeriesNameNoAgg seriesName
+                                         _                         -> False
+          validSeriesNameNoAgg seriesName = "/" `T.isPrefixOf` seriesName
+
+          aggregationAndTargetOf seriesName = case T.split (== ':') (unSeriesName seriesName) of
+                                                [aggNameT, seriesNameT] -> Just (SeriesName aggNameT, SeriesName seriesNameT)
+                                                _                       -> Nothing
 
 deleteTimeSeries :: SeriesName -> Update HQuantState ()
 deleteTimeSeries seriesName = do
@@ -105,9 +161,16 @@ timeSeriesDatum :: SeriesName -> UTCTime -> [Datum] -> Update HQuantState (Eithe
 timeSeriesDatum seriesName time dat = do
   st <- get
   case st ^. series ^. at seriesName of
-    Nothing -> return (Left $ "Unknown series: " ++ (T.unpack . unSeriesName $ seriesName))
+    Nothing -> case aggAndSeriesFromName seriesName of
+                 Nothing            -> return (Left $ "Unknown series: " ++ (T.unpack . unSeriesName $ seriesName))
+                 Just (agg, series) -> do
+                   -- This is an aggregation, so we may want to try creating the aggregation
+                   result <- newTimeSeries seriesName
+                   case result of
+                     Left err -> return (Left $ "Couldn't create aggregation: " ++ err)
+                     Right () -> timeSeriesDatum seriesName time dat -- Now that we've created the aggregation, we can continue
     Just newSeries
-        | length (_schemaDFields . _tsdSchema . _declaration $ newSeries) /= length dat ->
+        | length (_declaration newSeries) /= length dat ->
             return (Left "Bad data length")
         | otherwise -> do
            let updateSeq (FixedD i) (FixedSeq e s) = return $ FixedSeq e (s |> i)
@@ -163,17 +226,10 @@ deleteData seriesName from to = do
           series . at seriesName .= Just (series_ { _seriesData = newSeriesData, _times = spliceSeq (_times series_) })
           return (Right ())
 
-findAgg :: HQuantState -> AggregationName -> Maybe SeriesDeclaration
-findAgg st name = findAgg' (_declarations st)
-    where findAgg' [] = Nothing
-          findAgg' (a@AggregationDecl {_aggName}:_)
-              | _aggName == name = Just a
-          findAgg' (_:xs) = findAgg' xs
-
 aggregate :: AggregationName -> SeriesName -> UTCTime -> UTCTime -> Query HQuantState (Either String (Seq UTCTime, [SeriesSeqWrapper]))
 aggregate aggName seriesName startingAt endingAt = do
     st <- ask
-    case findAgg st aggName of
+    case findAgg aggName (_declarations st) of
       Nothing  -> return (Left "No aggregation found with that name")
       Just agg -> do
         case st ^. series ^. at seriesName of
@@ -194,7 +250,7 @@ aggregate aggName seriesName startingAt endingAt = do
                                                              in fmap snd group <|
                                                                 groupIntoPeriods times rest
 
-                  fieldNames         = map _fieldDName (_schemaDFields . _tsdSchema . _declaration $ series)
+                  fieldNames         = map _fieldDName (_declaration series)
                   groupedIntoPeriods = zip fieldNames $
                                        map (adjustSeq (DoubleSeq . groupIntoPeriods periods . Seq.zip (_times series))) (A.elems (_seriesData series))
 
