@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                hquant-state
-version:             0.1.0.0
+version:             1.0.0.0
 synopsis:            HQuant-State is a hybrid in-memory/persistent time series database for HQuant with full ACID guarantees.
 -- description:         
 homepage:            http://travis.athougies.net/projects/hquant
