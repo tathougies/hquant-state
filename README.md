@@ -12,9 +12,9 @@ notably, it only keeps a set amount of historical data in memory, and puts the r
 somewhere else. Currently, this storage can be either the local disk or an Amazon S3 bucket. This
 behavior is entirely configurable.
 
-HQuant-State also supports the Archival and Indexing of SEC EDGAR XBRL business reports. This means
-that it can be used to store historical balance sheets and income statements. Starting from 2011
+HQuant-State will also support the Archival and Indexing of SEC EDGAR XBRL business reports. This means
+that it could be used to store historical balance sheets and income statements. Starting from 2011
 onwards, the SEC requires all companies to submit electronic versions of their annual
-reports. Combine with a solution such as a HDeq and HDeq-EDGAR, you can define an adapter that will
-update the database whenever a new statement comes out. Once again, actual documents are stored
+reports. Combined with a solution such as a HDeq and HDeq-EDGAR, you will be able to define an adapter that will
+update the database whenever a new statement comes out. Once again, actual documents will be stored
 either on-disk or on Amazon S3.
